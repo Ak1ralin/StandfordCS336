@@ -724,7 +724,7 @@ To remain number of FLOPs stable so $d_{ff}$ lower
 
 Attention is just make $W_q,W_k,W_v$ can be more specific
 
-$head_{dim}$ mean dimension of output of each head
+$head_{dim}$ mean dimension of Q,K,V matrix of each head
 
 Typical relationship: $head_{dim} × num_{head} ≈ d_{model}$
 
@@ -839,51 +839,261 @@ Common tricks:
 
 A regularization term added to the output softmax.
 
+Problem came from Softmax
+$$P_i = \frac{e^{U_i}}{\sum_j{e^{U_j}}}$$
+$U_i$ is logit of token i
+
+$P_i$ is Prob of token i 
+
+$Z = \sum_j{e^{U_j}}$ called partition function/normalization constant
+
+Porblem 1 : exponential explosion
+
+$e^{U_i}$ can easily overflow or underflow when $U_i$ is extreme value like 100, -100
+
+Problem 2 : division Instability
+
+Z can also get effect due to $U_i$ value is not consistent
+
+But since most training use cross entropy so we actually more focus on log Z
+
+cross entropy = $\log P(x)$
+$$L = -\log P(x) = -\log \frac{e^{U}}{Z} = log Z - U$$
+$$L = -\log P(x+c) = -\log \frac{e^{U+c}}{Z*e^c} = log Z + c - U - c = log Z - U $$
+
+since for softmax [1,2,3] and [1001,1002,1003] is same so softmax is not sensitive to adding constant at all `softmax(x) = softmax(x+c)`
+
+So logit could able to drift to extreme value without effecting training loss, this lead to training instability due to fp16 overflow
+
+Solution : z-loss 
+
+Key Idea : adding extra regularition loss 
+$$L = -\log P(x) + \alpha(\log Z)^2$$
+$$L = log Z - U + \alpha(\log Z)^2$$
+z-loss = $\alpha(\log Z_i)^2$
+
+Focusing on log Z, $f(x) = x + \alpha x^2$, $f'(x) = 1 + 2\alpha x$
+
+f'(x) = 0 is minimum, log Z minimum will be around $-\frac{1}{2\alpha}$ this make log Z not overflow
+
+Main Idea is similar to weight decay, the property of softmax `x = x+c` lead to **gauge symmetry**, random walk in that symmetry which effect log Z call **log Z drift**, to break this symmetry same as how we break scale symmetry **so we add z-loss** into Loss.
+
 Purpose:
 
 -   prevent logits from becoming extremely large
 -   stabilize training
 
-Used in:
-
--   PaLM
--   OLMo
--   Baichuan
-
 ------------------------------------------------------------------------
 
 ##### 2. QK Normalization
 
-Normalize **queries and keys** before computing attention softmax.
+A normalization technique applied to **Query (Q)** and **Key (K)**
+vectors before computing attention.\
+The instability mainly comes from the interaction between **cross entropy training** and **dot-product attention**.
 
-Purpose:
+Problem 1 : Cross Entropy Encourages Large Logits
 
--   prevent large dot products
--   stabilize attention distribution
+Language models are trained using cross entropy
+
+$$
+L = -\log P_{target}
+$$
+
+Softmax probability
+
+$$
+P_i = \frac{e^{U_i}}{\sum_j e^{U_j}}
+$$
+
+$U_i$ = Logit of token (i)
+
+Loss can be written as
+
+$$
+L = -U_{target} + \log Z
+$$
+
+where
+
+$$
+Z = \sum_j e^{U_j}
+$$
+
+To reduce loss, the optimizer tends to increase `U_target ↑`
+
+So cross entropy naturally encourages **larger logits**.
+
+Problem 2 : Attention Uses Dot Product which depends on vector norms
+
+Inside Transformer layers, attention computes
+
+$$
+s_{ij} = q_i \cdot k_j
+$$
+
+where
+
+-   (q_i) : query vector of token (i)
+-   (k_j) : key vector of token (j)
+
+These scores become the logits of the **attention softmax**
+
+$$
+A_{ij} = \frac{e^{s_{ij}}}{\sum_j e^{s_{ij}}}
+$$
+
+$$
+h_i = \sum_j A_{ij}v_j
+$$
+
+$$
+U = Wh
+$$
+
+The dot product expands to
+
+$$
+q_i \cdot k_j = ||q_i|| \, ||k_j|| \cos\theta
+$$
+
+So the attention score depends on
+
+-   query magnitude
+-   key magnitude
+-   angle between vectors
+
+Problem 4 : Increasing Norms Is an Easy Way to Increase Logits
+
+To increase $s_{ij}$, the model can
+
+    1. change cosθ
+    2. increase ||q||
+    3. increase ||k||
+
+Changing the angle requires learning better representations.
+
+Increasing vector norms is much easier.
+
+Therefore the optimizer often uses the shortcut
+
+    ||q|| ↑
+    ||k|| ↑
+
+
+Problem 5 : Gradient Structure Amplifies q and k Together
+
+Gradients of the attention score propagate as
+
+$$
+\frac{\partial L}{\partial q_i} \propto k_j
+$$
+
+$$
+\frac{\partial L}{\partial k_j} \propto q_i
+$$
+
+This creates a **positive feedback loop**
+
+    q grows → gradient for k grows
+    k grows → gradient for q grows
+
+So both norms increase together
+
+    ||q|| ↑
+    ||k|| ↑
+
+Problem 6 : Norm Drift
+
+Because vector magnitudes are not constrained, training can produce
+
+    ||q|| ↑
+    ||k|| ↑
+
+over time.
+
+This phenomenon is called **norm drift** where parameter magnitudes gradually grow during optimization.
+
+All of these lead to **logit amplifier (fp16,bf16 overflow)** that lead to 
+
+**Softmax Saturation**
+
+Large logits make softmax extremely sharp
+
+    softmax([1,2,3]) → [0.09, 0.24, 0.67]
+    softmax([10,20,30]) → [0, 0, 1]
+
+This is called **softmax saturation**.
+
+Effects
+
+-   gradients become very small
+-   learning signal degrades
+-   training becomes unstable
 
 ------------------------------------------------------------------------
 
+Solution : QK Normalization
+
+Normalize query and key vectors before computing attention
+
+$$
+q'_i = \frac{q_i}{||q_i||}
+$$
+
+$$
+k'_j = \frac{k_j}{||k_j||}
+$$
+
+Then compute
+
+$$
+s_{ij} = q'_i \cdot k'_j
+$$
+
+This becomes cosine similarity
+
+$$
+s_{ij} = \cos\theta
+$$
+
+Since
+
+$$
+||q'|| = ||k'|| = 1
+$$
+
+attention scores are bounded
+
+    -1 ≤ s_{ij} ≤ 1
+
+QK normalization removes the ability of the model to increase attention
+scores by scaling vector norms.
+
+Since attention logits become
+
+$$s_ij = cosθ$$
+
+vector magnitude no longer affects the score.
+
+As a result:
+
+- increasing norms no longer reduces the loss
+  - norm drift is suppressed
+  - logit amplification disappears
+- softmax saturation becomes unlikely
+- large exponent values are avoided, reducing fp16 overflow risk
+
 ##### 3. Logit Soft‑Capping
-
+- Same problem like QK normalization, but this implement on output layer
 Apply:
-
-    tanh(logits)
+$$logits_{capped} = c*tanh(\frac{logits}{c})$$
 
 This caps extremely large logits.
 
-------------------------------------------------------------------------
-
-#### Efficient Attention Variants
-
-Standard attention cost:
-
-    O(n²)
-
-where:
-
-n = sequence length
-
-Several tricks reduce cost.
+Effect 
+  - prevent softmax saturation
+  - prevent overflow
+  - prevent logit amplifier
 
 ------------------------------------------------------------------------
 
@@ -891,7 +1101,8 @@ Several tricks reduce cost.
 
 Idea:
 
-Use many queries but **only one key/value head**.
+Use many **queries** but **only one key/value head**.
+  - Problem : because original MHA KV cache is too much, to reduce GPU ram and bandwidth, we choose to compress k & v from ($d_{model} -> d_{head}$) by reducing $ W_k,W_v $ from ($d_{model} \times d_{model}$ to $d_{model} \times d_{head}$)
 
 Benefits:
 
@@ -901,78 +1112,42 @@ Benefits:
 
 Tradeoff:
 
--   slightly worse perplexity.
+-   slightly worse performance.
 
 ------------------------------------------------------------------------
 
 #### Grouped Query Attention (GQA)
 
-Middle ground between:
+Middle ground between: full multi‑head attention and MQA
 
--   full multi‑head attention
--   MQA
+Queries are split into groups that **share keys/values**.\
+not every head queries use same k & v. but group these queries into a group, each group share k & v
 
-Queries are split into groups that share keys/values.
+- if every head queries in 1 group = MQA (least KV cache and bandwidth)
+- if every head queries is 1 group = MHA (most KV cache and bandwidth)
 
 Benefits:
 
 -   better quality than MQA
 -   still reduces inference cost
-
-Used in many modern LLMs.
-
+![MXA variants](src/mxaVariant.png)
 ------------------------------------------------------------------------
 
 #### Sparse / Sliding Window Attention
 
-Instead of attending to **all tokens**, restrict attention to:
-
--   nearby tokens
--   structured patterns
+Instead of attending to **all tokens ($n^2$ pairs)**, restrict attention to:
+  -   nearby tokens (SWA)
+    - k nearest tokens (nk pairs)
+      - problem : effective context length = #layer*k, else early token cant effect late token
+  -   structured patterns 
+    - nearby tokens and skipped (n-k token) past token
 
 Benefits:
 
 -   reduces quadratic cost
 -   supports long contexts
 
-Example: **Mistral sliding‑window attention**.
-
+FYI : modern LLMs use mixed attention : most layer use SWA, some use full attention
+  - Short-range : SWA + RoPE (because long-range might have cycle problem)
+  - Long-range : NoPE
 ------------------------------------------------------------------------
-
-# Key Takeaways
-
-Across modern LLMs there is significant convergence:
-
-### Architecture
-
-Common pattern:
-
--   Pre‑Norm
--   RMSNorm
--   RoPE
--   SwiGLU
-
-### Hyperparameters
-
-Typical values:
-
--   d_ff ≈ 4 × d_model
--   head_dim × heads ≈ d_model
--   vocab ≈ 30k--50k
-
-### Efficiency Tricks
-
--   MQA / GQA
--   sparse attention
--   KV cache optimization
-
-### Stability Tricks
-
--   z‑loss
--   QK normalization
--   logit soft‑capping
-
-Overall insight:
-
-Most modern LLMs are **very similar architectures with small
-improvements** rather than radically different designs.
