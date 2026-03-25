@@ -46,7 +46,9 @@ Compute depends only on **active parameters**, not total parameters.
 
 ------------------------------------------------------------------------
 
-# 3. Why This Works
+## 3. Why This Works
+
+Old FFN =  every token update same FFN, FFN must compromise, its actually lead to **gradient interference**.
 
 Chain:
 
@@ -54,27 +56,17 @@ Chain:
     ↓
     A single FFN must learn everything (specialized-A knowledge got distract by others specialized-B knowledge)
     ↓
-    Capacity is wasted
+    Capacity is shared (capacity ~ function : for old FFN, capacity must shared it self to both token-A and token-B)
     ↓
-    Instead specialize networks
-
-MoE creates:
-
-    Expert 1 → math
-    Expert 2 → code
-    Expert 3 → reasoning
-    Expert 4 → language
-    ...
+    Instead specialize networks (specialized capacity)
 
 Router decides which expert processes a token.
 
-Result:
-
-    Specialization + larger total capacity
+Result: Specialization + larger total capacity
 
 ------------------------------------------------------------------------
 
-# 4. Where MoE Is Used
+## 4. Where MoE Is Used
 
 Most models modify **only the FFN layer**.
 
@@ -86,69 +78,105 @@ Transformer block:
     ↓
     Residual
 
-Reason:
+Reason: FFN contains most parameters, So replacing FFN gives **maximum scaling benefit**.
 
-    FFN contains most parameters
+FYI : MHA of Attention is something looklike MoE is some senses, because it also contribute to specialized, but because overall params didnot increase so capacity also remain stable, and every token use all head so we could called it **"dense specialization"**, while MoE is sparse specialization.
+    - MHA factorized representation, while MoE increase capacity
+    - key reason attention not use MoE is because **Attention couples tokens together**
+    - multiple attention subspaces ～ structured big matrix
 
-So replacing FFN gives **maximum scaling benefit**.
+### Why MoE training is more efficient
+- Capacity increase (function represent easier/accutate), loss decrease easier
+- Less gradient interference
+- Divice fit / expert parallelism : each FFN can fit in a device
+    - But MoE mostly is more complex so single step latency is slower
 
+### Why haven't MoE been more popular?
+- Infrastructure is complex, and required more devices
+    - Will be great if you have multiple devices.
+    - And can separate data to each of device to make expert parallelism, else its will lead to inter-device communication which is expensive.
+- Training objective are somewhat heuristic.
+    - because router selection is discrete but training need gradient, so its hard to train router, in the past most lead to **expert collapse** until **auxiliary load balancing loss**
 ------------------------------------------------------------------------
 
-# 5. Routing (Most Important Part)
+
+## 5. Routing (Most Important Part)
 
 Router decides:
 
     which expert processes each token
 
 Typical method:
+- Top‑K routing
+    - Token chooses expert (**heuristic, best option**)
+    - Expert chooses token (token might not be pick)
+    - Global routing (bipartite matching, total highest, but mostly solve with Hugarian algorithm too much computing) but actually its intuitively best routing algorithm.
+- common baseline : hash routing -> `token_embedding % num_expert = rout_expert`, input space partition so naturally specialized, but it fixed so its normal that it will be bad than learnable like top-k
+- Others sol :
+    - RL routing : because top-k is discrete, so no gradient, so hard to use back-prop for training, so some try to use RL instead, and use loss as reward model to optimized router(policy)
+        - Problem : gradient variance is extremely big, training unstable 
 
-    Top‑K routing
-
-Process:
+Process (token choose expert):
 
     1. compute score for each expert
     2. choose K largest
     3. send token to those experts
     4. combine outputs
 
-Typical K values:
+------------------------------------------------------------------------
 
-    Switch Transformer → k=1
-    Mixtral → k=2
-    DBRX → k=4
-    DeepSeek → k≈6–8
+## 6. How Top-K work 
+$$
+s_{i,t} = h_t^T \cdot e_i
+$$
+$$
+g_{i,t} = \left\{\begin{array}{rcl}
+s_{i,t} : s_{i,t} \in TopK
+\\
+0 : otherwise  
+\end{array}\right.
+$$
+$$
+g_{i,t} = softmax(g_{i,t})
+$$
+$$
+h_t = \sum_{i=1}^{N_{expert}} (g_{i,t}FFN_i(h_t)) + h_t
+$$
 
 ------------------------------------------------------------------------
 
-# 6. Why Routing Is Hard
+## 7. Fine‑Grained Experts
 
-Problem:
+MoE each expert FFN $d_{ff}$ decrease so hidden embedding is smaller
 
-    Top‑K selection is discrete
+Old design: `few large experts` 
 
-Discrete operations have:
+New design: `many small experts` 
 
-    no gradient
-
-Which means:
-
-    backpropagation can't train it directly
-
-Solutions explored:
-
-    RL routing
-    stochastic routing
-    heuristic balancing losses
-
-In practice:
-
-    heuristic balancing losses win
-
-Because they are simple and stable.
+Reason:
+    smaller experts → more specialized (function decomposition), less gradient interference, higher specialized resolution
 
 ------------------------------------------------------------------------
 
-# 7. Load Balancing Problem
+## 8. Shared Experts
+
+Problem : Missroute (router might wrong) and some specialized is general needed for every tokens.
+
+Solution: shared experts
+
+These experts always run to prevent missroute, provide general backbone (base knowledge), help training stability
+
+Architecture: shared experts (weight = 1) + routed experts
+$$
+h_t = \sum_{i \in R} (g_{i,t}FFN_i(h_t))+ \sum_{j \in S} (g_{j,t}FFN_j(h_t)) +  + h_t
+$$
+
+- FYI : OIMoE points out that MoE does not significantly improve performance.
+    - nice to have, not fundamental
+
+------------------------------------------------------------------------
+
+## 9. Load Balancing Problem
 
 Without regulation:
 
@@ -169,55 +197,6 @@ that encourages
 Effect:
 
     overused expert → penalty
-
-------------------------------------------------------------------------
-
-# 8. Fine‑Grained Experts
-
-Recent models changed architecture.
-
-Old design:
-
-    few large experts
-
-New design:
-
-    many small experts
-
-Example:
-
-    DeepSeek V3
-    256 experts
-    top‑8 active
-
-Reason:
-
-    smaller experts → better specialization
-
-------------------------------------------------------------------------
-
-# 9. Shared Experts
-
-Problem:
-
-Some tokens need **general knowledge**.
-
-Solution:
-
-    shared experts
-
-These experts:
-
-    always run
-
-Architecture:
-
-    shared experts + routed experts
-
-Used by:
-
-    DeepSeek
-    Qwen
 
 ------------------------------------------------------------------------
 
