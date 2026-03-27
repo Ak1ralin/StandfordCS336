@@ -175,181 +175,157 @@ $$
     - nice to have, not fundamental
 
 ------------------------------------------------------------------------
+## 9. Training of MoE
 
-## 9. Load Balancing Problem
+Problem : need sparsity for training-time efficiency but sparse gating decisions are not differentiable -> no gradient, cant train router
 
-Without regulation:
+- Solution :
+    - Reinforcement Learning : router = policy, expert selecting = action, loss = -reward
+        - Huge Variance -> training instability
+    - Stochastic perturbations
+        - Stochastic = ramdom -> router logits + **noise**
+        - So router might explore different expert
+    - Heuristic balancing losses
+        - Load Balancing -> make every expert have approximate number of token
 
-    router may choose the same expert for every token
+### Load Balancing Problem
 
-Result:
+Without regulation : router may choose the same expert for every token (positive feedback loop)
 
-    expert collapse
+Result : `expert collapse`
 
-Fix:
+Solution : add auxiliary loss that encourages equal expert usage (every expert expect training with $\frac{batch \times len_{seq}}{num_{expert}}$)
 
-    add auxiliary loss
+Effect: overused expert → penalty
 
-that encourages
+Trade-Off : load-balancing sacrifices some routing optimality for training stability
 
-    equal expert usage
+#### Standard Auxiliary loss (Per-expert balancing) : N experts, batch $\Beta$ with T tokens
+$$L_{total} = L_{task} + L_{aux}$$
+$$L_{aux} = \alpha\cdot N \cdot \sum^N_{i=1}f_i\cdot P_i $$
+$f_i$ is the fraction of tokens dispatched to expert i
+$$
+f_i = \frac{1}{T}\sum_{x\in \Beta} 1 * argmax( p(x) = i) 
+$$
+$P_i$ is the average probability allocated for expert i
+$$
+P_i = \frac{1}{T}\sum_{x \in \Beta}p_i(x)
+$$
 
-Effect:
+#### Per device balancing 
+- just because if expert didnot equally distributed on device, some device might become bottleneck if using Per-device balancing, so we just change from i = expert to i = device
 
-    overused expert → penalty
+$f_i$ is the fraction of tokens dispatched to device i
+
+$P_i$ is the average probability allocated for device i
+
+Some papers found per-device balancing is important than per-expert balancing 
+
+#### Auxiliary Loss free Balancing
+- standard auxiliary loss : indirectly balanced by loss gradient 
+- Problem : $L_{task}$ wanna choose best expert (optimal route), but $L_{aux}$ wanna balance token, **gradient interference** hard to choose $\alpha$
+- Solution from DSv3 : Add a bias $b_i$ on routing score 
+$$s_i \rightarrow s_i + b_i$$
+routing from topk($s_i$) to topk($s_i + b_i$)
+
+for every step $b_i$ will update based on load, feedback control
+$$
+b_{i,t} \leftarrow b_{i,t-1} + \eta(load_{target} - load_{actual}) 
+$$
+
+Advantage : no gradient interference , more stable
 
 ------------------------------------------------------------------------
 
-# 10. Systems Advantage
+## 10. Systems Advantage
 
 MoE enables new parallelism.
 
-Observation:
+Observation: each expert is independent, so we can place experts on different GPUs (less inter-device communication). This creates **"Expert parallelism"** which scales very well to large clusters.
 
-    each expert is independent
+Moreover on same device, different expert can do batch matmul (**MegaBlocks**)
+- W1@x1 , W2@x2, W3@x3 = 3 matmuls
+$$ W = \begin{bmatrix}
+W_1 & 0 & 0 \\
+0 & W_2 & 0 \\
+0 & 0 & W_3
+\end{bmatrix} $$
 
-So we can place experts on different GPUs.
+$$X = concat(x1,x2,x3)$$
 
-This creates:
+$$ R = W@X$$
 
-    Expert parallelism
+GPU kernel will only compute non-zero block, so it's fine
 
-Which scales very well to large clusters.
+------------------------------------------------------------------------
+## 11. MoE Inference stochasticity
+- every expert have a limit on token processing in that batch, so sometimes if 1 expert have to process too much token -> it will drop some tokens off (because its sequencetial if we wait, will have stall which is waste of power), and the result will be 0, so this is the reason why 0 temperature which should be deterministic sometimes give different result -> sometimes drop, sometimes not
+
+Solved by
+- if any of expert is full -> route to second highest instead
+- increase limit 
 
 ------------------------------------------------------------------------
 
-# 11. Systems Difficulty
+## 12. Training Stability Issues
 
-MoE introduces heavy communication.
+Like Z-loss, softmax is unstable based on the gradient of softmax, backprop will definitely increase correct logit -> logit drift, and because softmax is exponential function, so when hit a red-line will become softmax saturation
 
-Because:
+The solution : z-loss for router softmax 
+    - prevent logit explosiion
 
-    tokens must be routed across devices
+### MoE Fine-tuning easier overfitting
 
-So we must perform:
-
-    token dispatch
-    expert execution
-    token gather
-
-Efficient implementations use:
-
-    sparse matrix kernels
-
-Example library:
-
-    MegaBlocks
+Just because data for training distribution might not uniform, and during fine-tuning mostly will disbale balancing so some expert when it meet small sft set, they can easily memorize all of this -> overfitting
 
 ------------------------------------------------------------------------
 
-# 12. Training Stability Issues
+## 13. Upcycling
 
-Routers are sensitive.
+Interesting technique : convert dense model → MoE
 
-Problems:
+- Steps:
+    - initialize experts from dense FFN , for finegrained -> partition dense FFN (its actually just mapping to higher feature space, so partition is like partition feature space and router is choosing which feature space is propriated)
+    - duplicate weights
+    - continue training
 
-    logit explosion
-    imbalanced routing
-    numerical instability
-
-Common fixes:
-
-    router in FP32
-    z‑loss regularization
-    routing jitter
+Benefit : reuse pretrained models
 
 ------------------------------------------------------------------------
 
-# 13. Upcycling
-
-Interesting technique:
-
-    convert dense model → MoE
-
-Steps:
-
-    1 initialize experts from dense FFN
-    2 duplicate weights
-    3 continue training
-
-Benefit:
-
-    reuse pretrained models
-
-Example:
-
-    Qwen MoE
-
-------------------------------------------------------------------------
-
-# 14. DeepSeek MoE Evolution
+## 14. DeepSeek MoE Evolution
 
 ### V1
-
-    16B total
-    2.8B active
-    shared + routed experts
-
+    - 2 shared + 64 fine-grained expert
+    - standard top-6 routing
+    - aux-loss balancing (expert only)
 ### V2
-
-    236B total
-    21B active
-    improved communication balancing
+    - 2 shared + 160 fine-grained expoert
+    - top-M device routing (choose device -> choose top-6 expert with device)
+    - aux-loss balancing (expert + communication(device) balancing loss)
 
 ### V3
-
-    671B total
-    37B active
-    256 experts
-    top‑8 routing
-
-------------------------------------------------------------------------
-
-# 15. Extra Techniques in DeepSeek V3
-
-## MLA (Multi‑Head Latent Attention)
-
-Idea:
-
-    compress KV representations
-
-Benefits:
-
-    smaller KV cache
-    lower memory
+    - 1 shared + 256 fine-grained expert
+    - top-M device routing (choose device -> choose top-8 expert with device)
+        - sigmoid top-k routing (use sigmoid instead of softmax)
+            - softmax is competitive, sigmoid is independent among expert
+    - seq-wise aux-loss balancing
+        - within 1 sequence, token should distributed, enhance effective capacity 
 
 ------------------------------------------------------------------------
 
-## MTP (Multi‑Token Prediction)
+## 15. MLA (Multi‑Head Latent Attention)
 
-Train model to predict:
+Idea : compress KV representations 
 
-    next token
-    future token
+normal : $h@W_K, h@W_V$
 
-Goal:
+MLA : $c = W@h , c@W_k, c@W_v$
 
-    better training efficiency
+Benefits: smaller KV cache (only save c)
 
-------------------------------------------------------------------------
-
-# 16. Final Intuition
-
-MoE scaling logic:
-
-    Dense scaling
-    params ↑ → compute ↑
-
-MoE scaling:
-
-    params ↑
-    active params constant
-    compute constant
-
-So MoE gives:
-
-    massive capacity
-    nearly same compute
+## 16. MTP (Multi-Token Prediction)
+Have small, lightweight models that predict multiple steps ahead
 
 ------------------------------------------------------------------------
 
