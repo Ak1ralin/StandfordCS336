@@ -48,11 +48,17 @@ x = torch.zeros(4,8) # 4x8 matrix of all zeros
 x = torch.ones(4,8) # 4x8 matrix of all ones
 x = torch.randn(4,8) # 4x8 matrix of iid Normal (0,1) samples
 x = torch.empty(4,8) # allocate but dont initialized values
-nn.init.trunc_normal_(x, mean=0, std = 1, a=-2,b=2) # custom logic to set the value
+torch.nn.init.trunc_normal_(x, mean=0, std = 1, a=-2,b=2) # custom logic to set the value
 ```
 
 Important: initialization methods like **Kaiming initialization** are
 used to set good starting weights.
+```python
+torch.nn.init.xavier_uniform_(x)
+torch.nn.init.xavier_normal_(x)
+torch.nn.init.kaiming_uniform_(x)
+torch.nn.init_kaiming_normal_(x)
+```
 
 ------------------------------------------------------------------------
 
@@ -70,9 +76,10 @@ Example:
 $$value = (-1)^{sign} * (1+frac) * 2^{exp-127}$$
 ```
 6.5 -> 6 + 0.5 -> b"110 + .1" = 110.1 = 1.101 * 2^2 
-frac = .101, exp = 2+127(bias)
+frac = .101, exp = 2+127
 ```
-why `bias` -> to easily compare and represent negative exp
+why `bias` -> to easily compare and represent negative exp (avoid sign comparison), exp = 0 is subnormal mean no leading 1, exp = max mean NaN
+$$bias = 2^{exp-1} - 1$$
 
 why `1+frac` cuz always 1.xxx , so make effective bit + 1 so implicit leading 1
 
@@ -104,6 +111,7 @@ Solution: **mixed precision training**.
 
 #### Total memory need
 `4 * (num_params + num_activation + num_grad + num_optimizer_states)`
+
 ------------------------------------------------------------------------
 
 ### GPU Usage
